@@ -1,14 +1,17 @@
 """MaiBot 报错日志推送插件。
 
 监控 MaiBot 的 JSONL 日志文件（logs/app_*.log.jsonl）中的 ERROR / CRITICAL
-报错，实时写入本插件目录下的 errors.log 完整归档，并按配置周期（默认 30 分钟）
+报错，实时写入本插件目录 errors/ 下的按天归档文件，并按配置周期（默认 30 分钟）
 通过 Server酱 聚合推送一条摘要到手机。
 
 设计要点：
 - MaiBot 插件运行在独立 Runner 子进程中，SDK 没有日志类 Hook / 事件，
   Host 主进程的日志无法在插件进程内直接获取，因此采用"监听日志文件"方案。
 - 推送语义为"过期不候"：跨日期的积压错误、超出每日条数上限的错误都不会
-  在之后补推，完整内容始终保留在本地 errors.log 中。
+  在之后补推，完整内容始终保留在本地 errors/ 归档中。
+- 通知阈值：同一错误在一个推送周期内出现次数达到 min_occurrences（默认 3）
+  才会进入通知；未达到阈值的错误只记录本地归档。
+- 配置模型定义在 config.py（WebUI 配置页元数据见该文件）。
 """
 
 from __future__ import annotations
@@ -16,127 +19,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import logging.handlers
 import time
 import urllib.parse
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, MaiBotPlugin
+from .config import ARCHIVE_DIR_NAME, ARCHIVE_KEEP_DAYS, ErrorNotifyConfig
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 
 APP_LOG_PATTERN = "app_*.log.jsonl"
-ARCHIVE_FILE = "errors.log"
 STATE_FILE = "state.json"
-
-ARCHIVE_MAX_BYTES = 10 * 1024 * 1024  # 10MB
-ARCHIVE_BACKUP_COUNT = 3
 
 TARGET_LEVELS = {"ERROR", "CRITICAL", "WARNING"}
 
 PUSH_MAX_PENDING = 5000  # 待推送缓冲上限，超出丢弃最旧条目（本地已归档）
-
-
-class PluginSectionConfig(PluginConfigBase):
-    """插件基础配置"""
-
-    __ui_label__ = "基础设置"
-    __ui_icon__ = "settings"
-    __ui_order__ = 0
-
-    config_version: str = Field(default="1.0.0", description="配置版本")
-    enabled: bool = Field(default=True, description="是否启用插件")
-    logs_dir: str = Field(
-        default="/MaiMBot/logs",
-        description="MaiBot 日志目录（容器内路径，如 /MaiMBot/logs）",
-        json_schema_extra={"placeholder": "/MaiMBot/logs", "group": "basic"},
-    )
-    scan_interval_sec: float = Field(
-        default=5.0,
-        description="日志扫描间隔（秒，1~60）",
-        json_schema_extra={"placeholder": "5", "group": "basic"},
-    )
-    include_warning: bool = Field(
-        default=False,
-        description="是否同时推送 WARNING 级别日志",
-        json_schema_extra={"group": "basic"},
-    )
-    backfill_on_start: bool = Field(
-        default=False,
-        description="启动时回扫最近一段时间内已发生的报错（弥补重启窗口）",
-        json_schema_extra={"group": "basic"},
-    )
-    backfill_minutes: int = Field(
-        default=10,
-        description="启动回扫的时间范围（分钟）",
-        json_schema_extra={"group": "basic"},
-    )
-
-
-class ServerChanSectionConfig(PluginConfigBase):
-    """Server酱 配置"""
-
-    __ui_label__ = "Server酱"
-    __ui_icon__ = "send"
-    __ui_order__ = 1
-
-    serverchan_sendkey: str = Field(
-        default="",
-        description="Server酱 SendKey（SCT 开头；留空则仅记录本地归档、不推送）",
-        json_schema_extra={"placeholder": "SCT...", "group": "serverchan"},
-    )
-    serverchan_api_base: str = Field(
-        default="https://sctapi.ftqq.com",
-        description="Server酱 API 地址（老版默认 sctapi.ftqq.com）",
-        json_schema_extra={"group": "serverchan"},
-    )
-
-
-class PushSectionConfig(PluginConfigBase):
-    """推送策略配置"""
-
-    __ui_label__ = "推送策略"
-    __ui_icon__ = "notifications"
-    __ui_order__ = 2
-
-    flush_interval_min: int = Field(
-        default=30,
-        description="推送聚合周期（分钟），按周期整数倍对齐（30 分钟即整点/半点）",
-        json_schema_extra={"group": "push"},
-    )
-    daily_push_limit: int = Field(
-        default=3,
-        description="每日推送条数上限，超限后仅记录本地归档，次日不补推",
-        json_schema_extra={"group": "push"},
-    )
-    max_entries_per_push: int = Field(
-        default=50,
-        description="单次推送最多逐条列出的错误数",
-        json_schema_extra={"group": "push"},
-    )
-    desc_max_len: int = Field(
-        default=4000,
-        description="推送正文最大字符数（超出截断，完整记录见 errors.log）",
-        json_schema_extra={"group": "push"},
-    )
-    entry_summary_len: int = Field(
-        default=200,
-        description="单条错误摘要的最大字符数",
-        json_schema_extra={"group": "push"},
-    )
-
-
-class ErrorNotifyConfig(PluginConfigBase):
-    """报错日志推送配置"""
-
-    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
-    serverchan: ServerChanSectionConfig = Field(default_factory=ServerChanSectionConfig)
-    push: PushSectionConfig = Field(default_factory=PushSectionConfig)
 
 
 class ErrorNotifyPlugin(MaiBotPlugin):
@@ -147,7 +49,6 @@ class ErrorNotifyPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._plugin_dir = Path(__file__).resolve().parent
-        self._archive_logger: logging.Logger | None = None
 
         self._scan_task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
@@ -169,7 +70,7 @@ class ErrorNotifyPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
 
     async def on_load(self) -> None:
-        self._setup_archive()
+        self._ensure_archive_dir()
         cfg = self.config
         self._logs_dir = self._resolve_logs_dir(cfg.plugin.logs_dir)
         self._min_ts = self._compute_min_ts(cfg)
@@ -185,9 +86,10 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         self._flush_task = asyncio.create_task(self._flush_loop(), name="error-notify-flush")
 
         self.ctx.logger.info(
-            "报错日志推送已加载，日志目录=%s，推送周期=%d 分钟，每日上限=%d",
+            "报错日志推送已加载，日志目录=%s，推送周期=%d 分钟，通知阈值=%d，每日上限=%d",
             self._logs_dir or "(未找到，请在配置中填写 logs_dir)",
             int(cfg.push.flush_interval_min),
+            int(cfg.push.min_occurrences),
             int(cfg.push.daily_push_limit),
         )
         if not cfg.serverchan.serverchan_sendkey:
@@ -388,12 +290,21 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         if not target:
             return
 
+        message = self._build_push_message(target, cfg)
+        if message is None:
+            self.ctx.logger.info(
+                "推送窗口内 %d 条错误均未达到通知阈值（%d 次），仅记录本地归档",
+                len(target),
+                int(cfg.push.min_occurrences),
+            )
+            return
+
         if self._pushed_today >= int(cfg.push.daily_push_limit):
             self.ctx.logger.warning(
-                "已达当日推送上限（%d），本批 %d 条错误不再推送（完整记录见 %s）",
+                "已达当日推送上限（%d），本批 %d 条错误不再推送（完整记录见 %s/）",
                 int(cfg.push.daily_push_limit),
                 len(target),
-                self._plugin_dir / ARCHIVE_FILE,
+                self._plugin_dir / ARCHIVE_DIR_NAME,
             )
             return
 
@@ -404,7 +315,7 @@ class ErrorNotifyPlugin(MaiBotPlugin):
                 self.ctx.logger.warning("未配置 serverchan_sendkey，本批 %d 条错误仅记录本地归档", len(target))
             return
 
-        title, desp = self._build_push_message(target, cfg)
+        title, desp = message
         ok = await self._send_serverchan(cfg, sendkey, title, desp)
         if ok:
             self._pushed_today += 1
@@ -413,26 +324,37 @@ class ErrorNotifyPlugin(MaiBotPlugin):
                 "已推送 %d 条错误（今日第 %d/%d 次）", len(target), self._pushed_today, int(cfg.push.daily_push_limit)
             )
 
-    def _build_push_message(self, target: list[dict], cfg: ErrorNotifyConfig) -> tuple[str, str]:
+    def _build_push_message(
+        self, target: list[dict], cfg: ErrorNotifyConfig
+    ) -> tuple[str, str] | None:
+        """聚合窗口内错误，返回 (title, desp)；若均未达通知阈值则返回 None。"""
+        min_occurrences = max(1, int(cfg.push.min_occurrences))
+
         # 同一错误在窗口内重复出现时合并为一条并计数
         merged: dict[tuple, dict] = {}
-        for r in target:
-            key = (r["level"], r["logger_name"], r["event"][:80])
+        for record in target:
+            key = (record["level"], record["logger_name"], record["event"][:80])
             item = merged.get(key)
             if item is None:
-                merged[key] = {"record": r, "count": 1}
+                merged[key] = {"record": record, "count": 1}
             else:
                 item["count"] += 1
         ordered = sorted(merged.values(), key=lambda x: x["record"]["ts"])
 
-        error_n = sum(1 for r in target if r["level"] == "ERROR")
-        critical_n = sum(1 for r in target if r["level"] == "CRITICAL")
-        warning_n = sum(1 for r in target if r["level"] == "WARNING")
+        # 只通知达到阈值（≥ min_occurrences 次）的错误类别
+        qualified = [item for item in ordered if item["count"] >= min_occurrences]
+        if not qualified:
+            return None
+
+        total_events = sum(item["count"] for item in qualified)
+        error_n = sum(item["count"] for item in qualified if item["record"]["level"] == "ERROR")
+        critical_n = sum(item["count"] for item in qualified if item["record"]["level"] == "CRITICAL")
+        warning_n = sum(item["count"] for item in qualified if item["record"]["level"] == "WARNING")
 
         summary_len = max(20, int(cfg.push.entry_summary_len))
         max_entries = max(1, int(cfg.push.max_entries_per_push))
         lines: list[str] = []
-        for item in ordered[:max_entries]:
+        for item in qualified[:max_entries]:
             record = item["record"]
             t = datetime.fromtimestamp(record["ts"]).strftime("%H:%M:%S")
             summary = record["event"] or (record["exception"].splitlines()[0] if record["exception"] else "-")
@@ -443,20 +365,23 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             suffix = f" ×{item['count']}" if item["count"] > 1 else ""
             lines.append(f"- `{t}` **[{record['level']}]** {location} — {summary}{suffix}")
 
-        start_ts = ordered[0]["record"]["ts"] if ordered else target[0]["ts"]
+        start_ts = qualified[0]["record"]["ts"]
         start_str = datetime.fromtimestamp(start_ts).strftime("%m-%d %H:%M")
-        parts = [f"**{start_str} 起** 共 {len(target)} 条（ERROR {error_n} / CRITICAL {critical_n} / WARNING {warning_n}）", ""]
+        parts = [
+            f"**{start_str} 起** 达标 {len(qualified)} 类 / {total_events} 条（ERROR {error_n} / CRITICAL {critical_n} / WARNING {warning_n}）",
+            "",
+        ]
         parts.extend(lines)
-        leftover = len(ordered) - max_entries
+        leftover = len(qualified) - max_entries
         if leftover > 0:
-            parts.append(f"\n…另有 {leftover} 种不同错误未列出，完整记录见插件目录 errors.log")
+            parts.append(f"\n…另有 {leftover} 种不同错误未列出，完整记录见插件目录 {ARCHIVE_DIR_NAME}/")
 
         desp = "\n".join(parts)
         max_len = max(200, int(cfg.push.desc_max_len))
         if len(desp) > max_len:
-            desp = desp[:max_len] + "\n\n…(正文已截断，完整记录见插件目录 errors.log)"
+            desp = desp[:max_len] + f"\n\n…(正文已截断，完整记录见插件目录 {ARCHIVE_DIR_NAME}/)"
 
-        title = f"[MaiBot报错] {len(target)}条 E{error_n}/C{critical_n}"
+        title = f"[MaiBot报错] {total_events}条 E{error_n}/C{critical_n}"
         return title, desp
 
     async def _send_serverchan(self, cfg: ErrorNotifyConfig, sendkey: str, title: str, desp: str) -> bool:
@@ -489,34 +414,51 @@ class ErrorNotifyPlugin(MaiBotPlugin):
                 return True
             except Exception as exc:  # noqa: BLE001 - 推送失败需要完整兜底
                 last_error = exc
-        self.ctx.logger.error("Server酱推送失败（已放弃重试）: %s，完整记录见 %s", last_error, self._plugin_dir / ARCHIVE_FILE)
+        self.ctx.logger.error("Server酱推送失败（已放弃重试）: %s，完整记录见 %s/", last_error, self._plugin_dir / ARCHIVE_DIR_NAME)
         return False
 
     # ------------------------------------------------------------------
-    # 本地错误归档
+    # 本地错误归档（errors/ 目录，按天分文件）
     # ------------------------------------------------------------------
 
-    def _setup_archive(self) -> None:
-        logger = logging.getLogger(f"{__name__}.archive")
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-        handler = logging.handlers.RotatingFileHandler(
-            self._plugin_dir / ARCHIVE_FILE,
-            maxBytes=ARCHIVE_MAX_BYTES,
-            backupCount=ARCHIVE_BACKUP_COUNT,
-            encoding="utf-8",
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-        self._archive_logger = logger
+    def _ensure_archive_dir(self) -> None:
+        try:
+            archive_dir = self._plugin_dir / ARCHIVE_DIR_NAME
+            archive_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self.ctx.logger.warning("无法创建错误归档目录 %s", self._plugin_dir / ARCHIVE_DIR_NAME)
+            return
+        self._cleanup_old_archives()
+
+    def _cleanup_old_archives(self) -> None:
+        """清理超过保留天数的归档文件（文件名按日期命名）。"""
+        try:
+            archive_dir = self._plugin_dir / ARCHIVE_DIR_NAME
+            if not archive_dir.is_dir():
+                return
+            cutoff = date.today() - timedelta(days=ARCHIVE_KEEP_DAYS)
+            for path in archive_dir.iterdir():
+                if not path.is_file() or not path.name.endswith(".log"):
+                    continue
+                try:
+                    file_date = date.fromisoformat(path.name[: -len(".log")])
+                except ValueError:
+                    continue
+                if file_date < cutoff:
+                    path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _write_archive(self, record: dict) -> None:
-        if self._archive_logger is None:
-            return
+        """将错误记录追加写到当日归档文件：errors/<YYYY-MM-DD>.log。"""
         try:
+            archive_dir = self._plugin_dir / ARCHIVE_DIR_NAME
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            path = archive_dir / f"{record['created_date']}.log"
             line = json.dumps(record, ensure_ascii=False)
-            self._archive_logger.info(line)
-        except Exception:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
             pass
 
     # ------------------------------------------------------------------
@@ -593,11 +535,18 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         return None
 
     def _compute_min_ts(self, cfg: ErrorNotifyConfig) -> float:
-        now = time.time()
-        if cfg.plugin.backfill_on_start:
-            minutes = max(1, int(cfg.plugin.backfill_minutes))
-            return now - minutes * 60
-        return now
+        """仅处理插件加载之后产生的日志，避免游标缺失/轮转时重推历史。
+
+        说明：启动回扫（backfill_on_start / backfill_minutes）功能已按需关闭，
+        config.py 中相应配置字段已移除。如需恢复，取消下方注释并在
+        config.py 的 PluginSectionConfig 中加回 backfill_on_start /
+        backfill_minutes 字段。
+        """
+        # if cfg.plugin.backfill_on_start:
+        #     minutes = max(1, int(cfg.plugin.backfill_minutes))
+        #     return time.time() - minutes * 60
+        del cfg
+        return time.time()
 
     @staticmethod
     def _parse_ts(value: Any) -> float:
