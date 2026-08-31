@@ -1,0 +1,35 @@
+{
+  "manifest_version": 2,
+  "id": "com.zhigengniao258.error-notify",
+  "name": "报错日志推送",
+  "version": "1.0.0",
+  "description": "监控 MaiBot 日志中的 ERROR/CRITICAL 报错，每 30 分钟通过 Server酱聚合推送一次到手机；完整错误记录同步保留在本插件目录的 errors.log，推送缺失不丢记录。",
+  "author": {
+    "name": "ZHIGENGNIAO258",
+    "url": "https://github.com/ZHIGENGNIAO258"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/ZHIGENGNIAO258/error-notify"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "integration",
+  "capabilities": [
+    "logger"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN",
+      "en-US"
+    ]
+  }
+}

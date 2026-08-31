@@ -1,0 +1,9 @@
+# 运行时生成，不入库
+/config.toml
+/errors.log*
+/state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
