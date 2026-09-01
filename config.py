@@ -35,7 +35,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__: ClassVar[int] = 0
 
     config_version: str = Field(
-        default="1.1.0",
+        default="1.2.0",
         description="插件配置结构版本号。",
         json_schema_extra={
             "label": "配置版本",
@@ -87,6 +87,18 @@ class PluginSectionConfig(PluginConfigBase):
             "hint": "默认只推送 ERROR/CRITICAL；开启后 WARNING 也进入统计与推送。",
             "order": 3,
             "group": "basic",
+        },
+    )
+    ignore_keywords: list[str] = Field(
+        default_factory=list,
+        description="忽略关键词列表：命中（大小写不敏感，匹配报错正文/堆栈/模块名）的错误不推送，但仍归档。",
+        json_schema_extra={
+            "label": "忽略关键词",
+            "hint": "每条一个关键词（如 webui.websocket、重复插件 ID）。命中即不推送，errors/ 归档保留。",
+            "order": 4,
+            "group": "basic",
+            "min_items": 0,
+            "max_items": 100,
         },
     )
 

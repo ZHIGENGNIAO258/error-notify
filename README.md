@@ -21,6 +21,7 @@ MaiBot 的插件运行在独立 Runner 子进程中，插件 SDK 没有日志类
 ```
 
 - **扫描**：默认 5 秒轮询一次（可配 1~60 秒）；每次只对当前日志文件做 `stat`，文件未变化时零 IO；日志轮转（5MB/30 份）自动跟随最新文件，字节游标持久化，重启不重复处理。
+- **关键词忽略**：命中 `ignore_keywords`（大小写不敏感，匹配 报错正文 event / 异常堆栈 exception / 日志名 logger_name / 模块名 module）的错误**不推送但照常归档**，适合"报错不影响实际使用"的常见噪音（如 WebUI 前端断连、重复插件 ID 隔离等）。
 - **通知阈值**：同一错误（级别+模块+事件主题）在一个推送周期内出现**达到 `min_occurrences` 次（默认 3）**才会进入推送；未达阈值的错误只记录本地归档（推送正文中同类条目合并标注 `×N`）。设为 `1` 则全部通知。
 - **推送语义（过期不候）**：每个错误带 `created_date`（本地日期）。每次推送只包含**当日**的错误；跨午夜窗口内的昨日错误、超出每日上限后的错误**一律不再补推**（只留本地 `errors/` 归档）。每日推送计数在 00:00 自动重置，次日只推送次日新错误。
 - **仅处理新增错误**：插件只处理加载之后产生的日志，不会重推启动前的历史报错。
@@ -39,11 +40,12 @@ MaiBot 的插件运行在独立 Runner 子进程中，插件 SDK 没有日志类
 
 ```toml
 [plugin]
-config_version = "1.1.0"      # 配置版本（WebUI 中隐藏，勿删）
+config_version = "1.2.0"      # 配置版本（WebUI 中隐藏，勿删）
 enabled = true                # 插件总开关
 logs_dir = "/MaiMBot/logs"    # MaiBot 日志目录（容器内路径）
 scan_interval_sec = 5.0       # 日志扫描间隔（秒，1~60）
 include_warning = false       # 是否同时处理 WARNING 级别
+ignore_keywords = []          # 忽略关键词：命中则不推送（仍归档）
 
 [serverchan]
 serverchan_sendkey = ""       # Server酱 SendKey（SCT 开头，留空只归档不推送）
@@ -64,6 +66,7 @@ entry_summary_len = 200       # 单条错误摘要最大字符数
 | `plugin.logs_dir` | `/MaiMBot/logs` | MaiBot 日志目录（容器内路径）。自动探测顺序：本配置值 → `/MaiMBot/logs` → 插件上级目录 `logs/` → 工作目录 `logs/`；Docker 下通常无需修改 |
 | `plugin.scan_interval_sec` | `5` | 日志扫描间隔（秒，1~60） |
 | `plugin.include_warning` | `false` | 是否同时处理 WARNING 级别（默认只处理 ERROR/CRITICAL） |
+| `plugin.ignore_keywords` | `[]` | **忽略关键词列表**：命中（大小写不敏感，匹配 event/exception/logger_name/module）的错误不推送、仍归档。示例：`["webui.websocket", "重复插件 ID", "napcat-adapter"]`（按模块整类忽略或按报错文案过滤均可） |
 | `serverchan.serverchan_sendkey` | 空 | Server酱 SendKey（`SCT` 开头，在 https://sct.ftqq.com/ 获取，WebUI 中为密码输入框）。留空则只记录本地归档、不推送 |
 | `serverchan.serverchan_api_base` | `https://sctapi.ftqq.com` | Server酱 API 地址，一般无需修改 |
 | `push.flush_interval_min` | `30` | 推送聚合周期（分钟），按周期整数倍对齐（30 分钟即整点/半点） |
@@ -108,6 +111,7 @@ python tests/smoke_test.py
 | 日志提示「未找到日志目录」 | 在配置中填写容器内实际路径，如 `/MaiMBot/logs` |
 | 日志提示「已达当日推送上限」 | 属预期；完整记录在 `errors/`；次日自动恢复推送 |
 | 日志提示「均未达到通知阈值」 | 属预期（`min_occurrences` 未达标）；完整记录在 `errors/`，降低该值可改为推送 |
+| 仍收到不影响的报错推送 | 在 `ignore_keywords` 中按模块名或报错文案添加关键词（如 `webui.websocket`、`重复插件 ID`）；命中后仅不推送、仍归档 |
 | 手机没收到推送 | 确认 `serverchan_sendkey` 已填；查看插件日志中「Server酱推送失败」的返回码；确认 Server酱套餐当日额度未用尽 |
 | 推送正文被截断 | 属预期（`desc_max_len`）；完整记录在 `errors/` |
 

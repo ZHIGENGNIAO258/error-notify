@@ -251,10 +251,26 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             "created_date": datetime.fromtimestamp(ts).date().isoformat(),
         }
         self._write_archive(record)
+        # 命中忽略关键词的错误只归档、不进入推送缓冲（见 _matches_ignore）
+        if self._matches_ignore(record):
+            return
         self._pending.append(record)
         if len(self._pending) > PUSH_MAX_PENDING:
             # 只丢"待推送"副本，本地归档不受影响
             self._pending = self._pending[-PUSH_MAX_PENDING:]
+
+    def _matches_ignore(self, record: dict) -> bool:
+        """关键词命中判断：大小写不敏感，匹配 event/exception/logger_name/module。
+
+        命中意味着"这类报错不影响实际使用"：仍写入 errors/ 归档，但不进入推送。
+        """
+        keywords = list(getattr(self.config.plugin, "ignore_keywords", None) or [])
+        if not keywords:
+            return False
+        haystack = " ".join(
+            str(record.get(field) or "") for field in ("event", "exception", "logger_name", "module")
+        ).lower()
+        return any(str(kw).strip().lower() in haystack for kw in keywords if str(kw).strip())
 
     # ------------------------------------------------------------------
     # 周期推送

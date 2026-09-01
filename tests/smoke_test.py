@@ -97,11 +97,12 @@ ARCHIVE_DIR_NAME = CONFIG_MOD.ARCHIVE_DIR_NAME
 
 def make_cfg(**overrides: Any) -> types.SimpleNamespace:
     plugin: dict[str, Any] = {
-        "config_version": "1.1.0",
+        "config_version": "1.2.0",
         "enabled": True,
         "logs_dir": "",
         "scan_interval_sec": 5.0,
         "include_warning": False,
+        "ignore_keywords": [],
     }
     serverchan: dict[str, Any] = {
         "serverchan_sendkey": "SCTTESTKEY",
@@ -356,6 +357,44 @@ def test_min_occurrences(tmp: Path) -> None:
     print("[OK] test_min_occurrences")
 
 
+def test_ignore_keywords(tmp: Path) -> None:
+    """命中忽略关键词的错误仅归档、不推送；大小写不敏感；可匹配正文/堆栈/模块名。"""
+    logs = tmp / "logs_ignore"
+    cfg = make_cfg(ignore_keywords=["WEBUI.WEBSOCKET", "重复插件 ID", "napcat-adapter"])
+    write_log(
+        logs,
+        "app_20260718_000000_main.log.jsonl",
+        [
+            # 命中 logger_name（大写关键词，验证大小写不敏感）
+            {"timestamp": now_minus(100), "level": "ERROR", "logger_name": "webui.websocket", "module": "src.webui.routers.websocket.manager", "lineno": 80, "event": "统一 WebSocket 发送失败: connection=abc, error="},
+            # 命中 event 正文
+            {"timestamp": now_minus(90), "level": "ERROR", "logger_name": "plugin_runtime.integration", "module": "src.plugin_runtime.integration", "lineno": 395, "event": "检测到重复插件 ID，冲突插件将被隔离，其余插件继续加载: maibot-team.napcat-adapter: 插件 ID 重复"},
+            # 命中 module（src.plugin_runtime 在 module 中仅对第二条……这里验证 module 字段单独命中）
+            {"timestamp": now_minus(80), "level": "ERROR", "logger_name": "plugin_runtime.group.core", "module": "src.plugin_runtime.host.supervisor", "lineno": 1762, "event": "插件注册失败: maibot-team.napcat-adapter"},
+            # 不命中任何关键词
+            {"timestamp": now_minus(70), "level": "ERROR", "logger_name": "maisaka.planner", "module": "planner.py", "lineno": 56, "event": "LLM 请求失败: timeout", "exception": "Traceback\nopenai.Timeout"},
+        ],
+    )
+    cfg.plugin.logs_dir = str(logs)
+    plugin = make_plugin(tmp, cfg)
+    plugin._logs_dir = plugin._resolve_logs_dir(cfg.plugin.logs_dir)
+    plugin._min_ts = 0.0
+    plugin._load_state()
+    plugin._scan_once()
+
+    # 只推送未命中的 1 条
+    events = [r["event"] for r in plugin._pending]
+    assert events == ["LLM 请求失败: timeout"], f"忽略过滤失败: {events}"
+
+    # 归档仍保留全部 4 条（仅不推送、仍归档）
+    archived_file = archive_path(plugin)
+    assert archived_file.exists()
+    archived = [json.loads(x) for x in archived_file.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert len(archived) == 4, f"归档不应被过滤: {len(archived)}"
+    # 无关键词时全部进入推送缓冲：由 test_scan_and_archive 覆盖（默认 ignore_keywords=[]）
+    print("[OK] test_ignore_keywords")
+
+
 def test_flush_build_and_limits(tmp: Path) -> None:
     cfg = make_cfg(min_occurrences=1, daily_push_limit=1, desc_max_len=300, entry_summary_len=50)
     now = time.time()
@@ -466,6 +505,7 @@ def main() -> None:
         test_cursor_resume(tmp / "case_cursor")
         test_rotation_drain(tmp / "case_rotation")
         test_min_occurrences(tmp / "case_threshold")
+        test_ignore_keywords(tmp / "case_ignore")
         test_flush_build_and_limits(tmp / "case_flush")
         test_sendkey_empty(tmp / "case_sendkey")
         test_archive_cleanup(tmp / "case_cleanup")
