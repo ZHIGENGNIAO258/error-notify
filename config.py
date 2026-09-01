@@ -35,7 +35,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__: ClassVar[int] = 0
 
     config_version: str = Field(
-        default="1.2.0",
+        default="1.3.0",
         description="插件配置结构版本号。",
         json_schema_extra={
             "label": "配置版本",
@@ -101,6 +101,18 @@ class PluginSectionConfig(PluginConfigBase):
             "max_items": 100,
         },
     )
+    warning_as_error_keywords: list[str] = Field(
+        default_factory=list,
+        description="WARN 视同 ERROR 白名单：命中关键词的 WARNING 日志即使未开启 include_warning，也按 ERROR 处理并进入推送。",
+        json_schema_extra={
+            "label": "WARN 视同 ERROR（白名单）",
+            "hint": "命中（大小写不敏感，匹配日志名/模块名/正文）的 WARNING 按 ERROR 推送，例如 NapCat 断连可填 napcat；未命中的 WARNING 仍按原规则处理。",
+            "order": 5,
+            "group": "basic",
+            "min_items": 0,
+            "max_items": 100,
+        },
+    )
 
 
 class ServerChanSectionConfig(PluginConfigBase):
@@ -126,7 +138,7 @@ class ServerChanSectionConfig(PluginConfigBase):
         description="Server酱推送接口基址。",
         json_schema_extra={
             "label": "接口地址",
-            "hint": "老版默认 sctapi.ftqq.com，一般无需修改。",
+            "hint": "仅支持 https（默认 sctapi.ftqq.com，老版）。非官方域名将在加载时告警；localhost/内网地址会被拒绝。注意 SendKey 与错误内容会发送到该地址。",
             "order": 1,
         },
     )

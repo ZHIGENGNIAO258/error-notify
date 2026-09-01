@@ -22,6 +22,7 @@ MaiBot 的插件运行在独立 Runner 子进程中，插件 SDK 没有日志类
 
 - **扫描**：默认 5 秒轮询一次（可配 1~60 秒）；每次只对当前日志文件做 `stat`，文件未变化时零 IO；日志轮转（5MB/30 份）自动跟随最新文件，字节游标持久化，重启不重复处理。
 - **关键词忽略**：命中 `ignore_keywords`（大小写不敏感，匹配 报错正文 event / 异常堆栈 exception / 日志名 logger_name / 模块名 module）的错误**不推送但照常归档**，适合"报错不影响实际使用"的常见噪音（如 WebUI 前端断连、重复插件 ID 隔离等）。
+- **WARN 视同 ERROR（白名单）**：命中 `warning_as_error_keywords`（匹配规则同上）的 WARNING 即使 `include_warning` 为 false 也会**提升为 ERROR 处理**、进入通知阈值统计与推送（推送与归档中记录为 ERROR，并保留 `promoted_from: WARNING` 标注原始级别）。适合 NapCat 断连这类"报错级别虽为 WARN、但意味着 bot 失去收发能力"的告警，不必开全量 WARN。
 - **通知阈值**：同一错误（级别+模块+事件主题）在一个推送周期内出现**达到 `min_occurrences` 次（默认 3）**才会进入推送；未达阈值的错误只记录本地归档（推送正文中同类条目合并标注 `×N`）。设为 `1` 则全部通知。
 - **推送语义（过期不候）**：每个错误带 `created_date`（本地日期）。每次推送只包含**当日**的错误；跨午夜窗口内的昨日错误、超出每日上限后的错误**一律不再补推**（只留本地 `errors/` 归档）。每日推送计数在 00:00 自动重置，次日只推送次日新错误。
 - **仅处理新增错误**：插件只处理加载之后产生的日志，不会重推启动前的历史报错。
@@ -34,22 +35,23 @@ MaiBot 的插件运行在独立 Runner 子进程中，插件 SDK 没有日志类
 
 ## 配置（WebUI 插件配置页，或编辑插件目录 `config.toml`）
 
-配置模型定义在 `config.py`，WebUI 配置页按「基础设置 / Server酱 / 推送策略」三个分组渲染，各字段带中文标签、提示与数值范围约束（如扫描间隔 1~60 秒、聚合周期 1~1440 分钟等，非法输入会被拦截）。
+配置模型定义在 `config.py`，WebUI 配置页按「基础设置 / Server酱 / 推送策略」三个分组渲染，各字段带中文标签、提示与数值范围约束（如扫描间隔 1-60 秒、聚合周期 1-1440 分钟等，非法输入会被拦截）。
 
-配置为 `[plugin]` / `[serverchan]` / `[push]` 三段结构（MaiBot 插件配置规范要求配置模型必须包含 `[plugin]` 节及 `plugin.config_version`）：
+配置为 `[plugin]` / `[serverchan]` / `[push]` 三段结构：
 
 ```toml
 [plugin]
-config_version = "1.2.0"      # 配置版本（WebUI 中隐藏，勿删）
+config_version = "1.3.0"      # 配置版本（WebUI 中隐藏，勿删）
 enabled = true                # 插件总开关
 logs_dir = "/MaiMBot/logs"    # MaiBot 日志目录（容器内路径）
 scan_interval_sec = 5.0       # 日志扫描间隔（秒，1~60）
 include_warning = false       # 是否同时处理 WARNING 级别
 ignore_keywords = []          # 忽略关键词：命中则不推送（仍归档）
+warning_as_error_keywords = []  # WARN 视同 ERROR 白名单：命中即按 ERROR 推送（如 ["napcat"]）
 
 [serverchan]
 serverchan_sendkey = ""       # Server酱 SendKey（SCT 开头，留空只归档不推送）
-serverchan_api_base = "https://sctapi.ftqq.com"  # 老版默认值，一般无需修改
+serverchan_api_base = "https://sctapi.ftqq.com"  # 仅支持 https；非官方域名加载时告警；localhost/内网地址会被拒绝
 
 [push]
 flush_interval_min = 30       # 推送聚合周期（分钟），对齐整点/半点
@@ -67,8 +69,9 @@ entry_summary_len = 200       # 单条错误摘要最大字符数
 | `plugin.scan_interval_sec` | `5` | 日志扫描间隔（秒，1~60） |
 | `plugin.include_warning` | `false` | 是否同时处理 WARNING 级别（默认只处理 ERROR/CRITICAL） |
 | `plugin.ignore_keywords` | `[]` | **忽略关键词列表**：命中（大小写不敏感，匹配 event/exception/logger_name/module）的错误不推送、仍归档。示例：`["webui.websocket", "重复插件 ID", "napcat-adapter"]`（按模块整类忽略或按报错文案过滤均可） |
+| `plugin.warning_as_error_keywords` | `[]` | **WARN 视同 ERROR 白名单**：命中（大小写不敏感，匹配 event/logger_name/module）的 WARNING 即使 `include_warning` 为 false 也按 ERROR 处理并推送。示例：`["napcat"]`（NapCat 断连等"bot 失联"级别告警），避免因开全量 WARN 推送过多噪音 |
 | `serverchan.serverchan_sendkey` | 空 | Server酱 SendKey（`SCT` 开头，在 https://sct.ftqq.com/ 获取，WebUI 中为密码输入框）。留空则只记录本地归档、不推送 |
-| `serverchan.serverchan_api_base` | `https://sctapi.ftqq.com` | Server酱 API 地址，一般无需修改 |
+| `serverchan.serverchan_api_base` | `https://sctapi.ftqq.com` | Server酱 API 地址，一般无需修改。仅支持 `https`；指向非官方域名（`ftqq.com` / `ft07.com` 之外）时加载会告警；指向 localhost / 内网地址会被拒绝 |
 | `push.flush_interval_min` | `30` | 推送聚合周期（分钟），按周期整数倍对齐（30 分钟即整点/半点） |
 | `push.daily_push_limit` | `3` | 每日推送条数上限。按你的 Server酱套餐额度调整（免费版通常每日 3~5 条）；超限后仅记录本地归档 |
 | `push.min_occurrences` | `3` | **通知阈值**：同一错误在一个推送周期内出现次数达到该值才进入推送；设 1 表示全部通知 |
@@ -76,7 +79,11 @@ entry_summary_len = 200       # 单条错误摘要最大字符数
 | `push.desc_max_len` | `4000` | 推送正文最大字符数，超出截断（完整内容见 `errors/` 归档） |
 | `push.entry_summary_len` | `200` | 单条错误摘要的最大字符数 |
 
-> ⚠️ **从旧版本升级**：如果插件目录已存在旧版生成的 `config.toml`（缺少 `[plugin]` 节或缺新字段），删除后重载插件，Runner 会按新配置模型重新生成。
+## 隐私与安全说明
+
+- 推送给 Server酱 的正文来自日志的 `event` / `exception` 原始文本，可能夹带敏感内容（如 API Key、对话内容、本地路径等），请自行评估风险或提前脱敏：可将命中敏感关键词的错误加入 `ignore_keywords`（仅不推送，本地 `errors/` 归档仍保留完整记录）。
+- 每次推送会把 SendKey 与错误内容一并发送到 `serverchan_api_base` 指向的地址（默认 `https://sctapi.ftqq.com`，第三方服务）。插件仅支持 `https`；指向 localhost / 内网 / 保留地址 会被拒绝；指向非官方域名（`ftqq.com` / `ft07.com` 之外，如自建兼容服务）时，加载时会在插件日志中给出告警，请自行确认该服务可信。
+- 本地 `errors/` 归档包含完整异常堆栈，注意插件目录（`plugins/error-notify/`）的访问权限。
 
 ## 本地文件
 
@@ -113,6 +120,8 @@ python tests/smoke_test.py
 | 日志提示「均未达到通知阈值」 | 属预期（`min_occurrences` 未达标）；完整记录在 `errors/`，降低该值可改为推送 |
 | 仍收到不影响的报错推送 | 在 `ignore_keywords` 中按模块名或报错文案添加关键词（如 `webui.websocket`、`重复插件 ID`）；命中后仅不推送、仍归档 |
 | 手机没收到推送 | 确认 `serverchan_sendkey` 已填；查看插件日志中「Server酱推送失败」的返回码；确认 Server酱套餐当日额度未用尽 |
+| 日志提示「serverchan_api_base 无效」 | 接口地址仅支持 https，且不能指向 localhost / 内网 / 保留地址；修正后重载插件 |
+| 日志提示「serverchan_api_base 非官方域名告警」 | 属预期告警，说明接口地址未使用官方域名（如自建/兼容服务）；确认服务可信后可忽略 |
 | 推送正文被截断 | 属预期（`desc_max_len`）；完整记录在 `errors/` |
 
 ## 已适配环境

@@ -7,6 +7,8 @@
 4. 推送聚合、摘要截断、每日上限、跨日期"过期不候"
 5. 通知阈值：同一错误达到 min_occurrences 才推送
 6. 对齐下一个推送边界的时间计算
+7. WARN 视同 ERROR 白名单：命中关键词的 WARNING 按 ERROR 推送，未命中维持原规则
+8. serverchan_api_base 校验（仅 https、拒绝内网/回环，非官方域名告警）
 
 用法:  python tests/smoke_test.py
 """
@@ -97,12 +99,13 @@ ARCHIVE_DIR_NAME = CONFIG_MOD.ARCHIVE_DIR_NAME
 
 def make_cfg(**overrides: Any) -> types.SimpleNamespace:
     plugin: dict[str, Any] = {
-        "config_version": "1.2.0",
+        "config_version": "1.3.0",
         "enabled": True,
         "logs_dir": "",
         "scan_interval_sec": 5.0,
         "include_warning": False,
         "ignore_keywords": [],
+        "warning_as_error_keywords": [],
     }
     serverchan: dict[str, Any] = {
         "serverchan_sendkey": "SCTTESTKEY",
@@ -395,6 +398,115 @@ def test_ignore_keywords(tmp: Path) -> None:
     print("[OK] test_ignore_keywords")
 
 
+def test_warning_promote(tmp: Path) -> None:
+    """WARN 视同 ERROR 白名单：命中的 WARNING 按 ERROR 处理并推送，未命中维持原规则。"""
+    logs = tmp / "logs_promote"
+    cfg = make_cfg(
+        include_warning=False,
+        warning_as_error_keywords=["napcat"],
+        min_occurrences=1,
+        daily_push_limit=10,
+    )
+    write_log(
+        logs,
+        "app_20260718_000000_main.log.jsonl",
+        [
+            # 命中白名单：NapCat 断连（WARN）→ 提升为 ERROR
+            {
+                "timestamp": now_minus(100),
+                "level": "WARNING",
+                "logger_name": "plugin.maibot-team.napcat-adapter",
+                "module": "src.adapters.napcat",
+                "lineno": 1,
+                "event": "NapCat 适配器连接已断开: ws://172.22.0.2:3001，未收到更多 WebSocket 消息，连接已结束；将在 5 秒后重连",
+            },
+            # 未命中：普通 WARN → 不推送（include_warning=false）
+            {"timestamp": now_minus(90), "level": "WARNING", "logger_name": "x", "event": "普通重试告警"},
+            # ERROR 正常
+            {"timestamp": now_minus(80), "level": "ERROR", "logger_name": "m", "module": "m.py", "lineno": 1, "event": "报错E"},
+        ],
+    )
+    cfg.plugin.logs_dir = str(logs)
+    plugin = make_plugin(tmp / "promote_a", cfg)
+    plugin._logs_dir = plugin._resolve_logs_dir(cfg.plugin.logs_dir)
+    plugin._min_ts = 0.0
+    plugin._load_state()
+    plugin._scan_once()
+
+    # pending：napcat WARN 已提升为 ERROR + 普通 ERROR，共 2 条；普通 WARN 不进
+    assert len(plugin._pending) == 2, [r["event"] for r in plugin._pending]
+    napcat = [r for r in plugin._pending if "napcat" in r["logger_name"]][0]
+    assert napcat["level"] == "ERROR", napcat
+    assert napcat["promoted_from"] == "WARNING", napcat
+    assert all(r["event"] != "普通重试告警" for r in plugin._pending)
+
+    # 归档同样记录提升后的级别与原始级别
+    archived_file = archive_path(plugin)
+    archived = [json.loads(x) for x in archived_file.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert len(archived) == 2, archived
+    arch_napcat = [r for r in archived if "napcat" in r["logger_name"]][0]
+    assert arch_napcat["level"] == "ERROR" and arch_napcat["promoted_from"] == "WARNING", arch_napcat
+
+    # 推送：提升项计入 ERROR 统计
+    calls: list[tuple] = []
+
+    async def fake_send(cfg_, sendkey, title, desp):
+        calls.append((sendkey, title, desp))
+        return True
+
+    plugin._send_serverchan = fake_send  # type: ignore[method-assign]
+    asyncio.run(plugin._flush_once())
+    assert len(calls) == 1, calls
+    _, title, desp = calls[0]
+    assert title == "[MaiBot报错] 2条 E2/C0", title
+    assert "[ERROR]" in desp and "NapCat" in desp, desp
+
+    # include_warning=true：命中仍提升为 ERROR，未命中保持 WARNING 并推送
+    cfg2 = make_cfg(include_warning=True, warning_as_error_keywords=["napcat"], min_occurrences=1)
+    logs2 = tmp / "logs_promote2"
+    write_log(
+        logs2,
+        "app_20260718_000000_main.log.jsonl",
+        [
+            {"timestamp": now_minus(100), "level": "WARNING", "logger_name": "plugin.maibot-team.napcat-adapter", "event": "NapCat 适配器连接已断开"},
+            {"timestamp": now_minus(90), "level": "WARNING", "logger_name": "x", "event": "普通重试告警"},
+        ],
+    )
+    cfg2.plugin.logs_dir = str(logs2)
+    plugin2 = make_plugin(tmp / "promote_b", cfg2)
+    plugin2._logs_dir = plugin2._resolve_logs_dir(cfg2.plugin.logs_dir)
+    plugin2._min_ts = 0.0
+    plugin2._load_state()
+    plugin2._scan_once()
+    assert len(plugin2._pending) == 2, [r["event"] for r in plugin2._pending]
+    by_event = {r["event"]: r for r in plugin2._pending}
+    assert by_event["NapCat 适配器连接已断开"]["level"] == "ERROR"
+    assert by_event["普通重试告警"]["level"] == "WARNING"
+    assert "promoted_from" not in by_event["普通重试告警"]
+
+    # ignore_keywords 优先：命中白名单但同时也命中忽略关键词 → 归档不推送
+    cfg3 = make_cfg(include_warning=False, warning_as_error_keywords=["napcat"], ignore_keywords=["napcat"])
+    logs3 = tmp / "logs_promote3"
+    write_log(
+        logs3,
+        "app_20260718_000000_main.log.jsonl",
+        [
+            {"timestamp": now_minus(100), "level": "WARNING", "logger_name": "plugin.maibot-team.napcat-adapter", "event": "NapCat 适配器连接已断开"},
+        ],
+    )
+    cfg3.plugin.logs_dir = str(logs3)
+    plugin3 = make_plugin(tmp / "promote_c", cfg3)
+    plugin3._logs_dir = plugin3._resolve_logs_dir(cfg3.plugin.logs_dir)
+    plugin3._min_ts = 0.0
+    plugin3._load_state()
+    plugin3._scan_once()
+    assert plugin3._pending == [], plugin3._pending
+    archived_files = archive_path(plugin3)
+    archived3 = [json.loads(x) for x in archived_files.read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert len(archived3) == 1 and archived3[0]["promoted_from"] == "WARNING", archived3
+    print("[OK] test_warning_promote")
+
+
 def test_flush_build_and_limits(tmp: Path) -> None:
     cfg = make_cfg(min_occurrences=1, daily_push_limit=1, desc_max_len=300, entry_summary_len=50)
     now = time.time()
@@ -452,6 +564,108 @@ def test_sendkey_empty(tmp: Path) -> None:
     print("[OK] test_sendkey_empty")
 
 
+def test_api_base_validation() -> None:
+    """接口地址校验：仅 https；拒绝回环/内网/保留地址；非官方域名通过但告警。"""
+    v = _plugin_mod.ErrorNotifyPlugin._validate_api_base
+
+    # 官方域名：通过且无需告警
+    for official in (
+        "https://sctapi.ftqq.com",
+        "https://sct.ftqq.com",
+        "https://sc3.ft07.com",
+        "https://abc.push.ft07.com",
+        "https://sctapi.ftqq.com/",
+    ):
+        assert v(official) == (True, ""), v(official)
+
+    # 非官方域名：通过但带告警文案
+    ok, msg = v("https://push.example.com")
+    assert ok and "官方域名" in msg and "请确认服务可信" in msg, (ok, msg)
+    ok, msg = v("https://not-ftqq.com")  # 精确后缀匹配，不误判 xftqq.com
+    assert ok and "官方域名" in msg, (ok, msg)
+
+    # 拒绝：非 https / 空值 / 缺主机 / 回环 / 内网 / 链路本地 / 保留地址
+    for bad in (
+        "http://sctapi.ftqq.com",
+        "sctapi.ftqq.com",  # 缺 scheme
+        "",
+        "https://",
+        "https://localhost",
+        "https://foo.localhost",
+        "https://nas.local",  # mDNS 内网名
+        "https://127.0.0.1",
+        "https://[::1]",
+        "https://0.0.0.0",
+        "https://10.0.0.5",
+        "https://192.168.1.1",
+        "https://172.16.0.9",
+        "https://169.254.169.254",  # 云厂商元数据服务地址
+        "https://100.64.0.1",  # CGNAT
+    ):
+        ok, msg = v(bad)
+        assert not ok, f"{bad!r} 应被拒绝: {msg}"
+    print("[OK] test_api_base_validation")
+
+
+def test_api_base_block_flush(tmp: Path) -> None:
+    """接口地址非法时，_flush_once 不发起推送、不消耗每日额度。
+
+    使用真实 _send_serverchan：校验失败时在发起网络请求前返回 False，
+    不会把 SendKey / 错误内容发到任何地址。
+    """
+    cfg = make_cfg(min_occurrences=1, serverchan_api_base="https://169.254.169.254")
+    plugin = make_plugin(tmp, cfg)
+    plugin._logs_dir = tmp / "logs"
+    today = date.today().isoformat()
+    plugin._pending = [
+        {
+            "ts": time.time(),
+            "timestamp": iso_ts(time.time()),
+            "level": "ERROR",
+            "logger_name": "m",
+            "module": "m.py",
+            "lineno": 1,
+            "event": "e",
+            "exception": "",
+            "created_date": today,
+        }
+    ]
+    asyncio.run(plugin._flush_once())
+    assert plugin._pushed_today == 0, "非法接口地址不应推送、不应消耗每日额度"
+    print("[OK] test_api_base_block_flush")
+
+
+def test_load_warns_api_base(tmp: Path) -> None:
+    """加载时：非法地址报 ERROR；非官方域名报 WARNING；官方域名不告警。"""
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    _plugin_logger.addHandler(handler)
+    _plugin_logger.setLevel(logging.INFO)
+    try:
+        cfg = make_cfg(serverchan_api_base="https://push.example.com")
+        plugin = make_plugin(tmp, cfg)
+        plugin._log_api_base_warning(cfg)
+        warns = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
+        assert any("非官方" in m for m in warns), warns
+
+        records.clear()
+        cfg = make_cfg(serverchan_api_base="http://192.168.1.1")
+        plugin = make_plugin(tmp, cfg)
+        plugin._log_api_base_warning(cfg)
+        errs = [r.getMessage() for r in records if r.levelno >= logging.ERROR]
+        assert any("配置无效" in m for m in errs), errs
+
+        records.clear()
+        cfg = make_cfg()
+        plugin = make_plugin(tmp, cfg)
+        plugin._log_api_base_warning(cfg)
+        assert records == [], f"官方域名不应产生任何日志: {[r.getMessage() for r in records]}"
+    finally:
+        _plugin_logger.removeHandler(handler)
+    print("[OK] test_load_warns_api_base")
+
+
 def test_archive_cleanup(tmp: Path) -> None:
     """启动清理：只保留最近 ARCHIVE_KEEP_DAYS 天的归档文件。"""
     cfg = make_cfg()
@@ -506,8 +720,12 @@ def main() -> None:
         test_rotation_drain(tmp / "case_rotation")
         test_min_occurrences(tmp / "case_threshold")
         test_ignore_keywords(tmp / "case_ignore")
+        test_warning_promote(tmp / "case_promote")
         test_flush_build_and_limits(tmp / "case_flush")
         test_sendkey_empty(tmp / "case_sendkey")
+        test_api_base_validation()
+        test_api_base_block_flush(tmp / "case_base_block")
+        test_load_warns_api_base(tmp / "case_base_warn")
         test_archive_cleanup(tmp / "case_cleanup")
         test_boundary()
         test_parse_ts()

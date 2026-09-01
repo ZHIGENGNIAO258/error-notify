@@ -11,12 +11,20 @@
   在之后补推，完整内容始终保留在本地 errors/ 归档中。
 - 通知阈值：同一错误在一个推送周期内出现次数达到 min_occurrences（默认 3）
   才会进入通知；未达到阈值的错误只记录本地归档。
+- WARNING 策略：默认只处理 ERROR/CRITICAL；开启 include_warning 则全量处理；
+  warning_as_error_keywords 白名单命中的 WARNING（如 NapCat 断连）即使未开启
+  include_warning 也按 ERROR 处理并推送，归档中保留 promoted_from=WARNING
+  记录原始级别。
+- 接口安全：serverchan_api_base 仅接受 https；回环 / 内网 / 链路本地等
+  IP 字面量地址直接拒绝（不发起任何网络请求）；非官方域名（ftqq.com /
+  ft07.com 之外）在加载时输出告警，提示 SendKey 与错误内容将发往该地址。
 - 配置模型定义在 config.py（WebUI 配置页元数据见该文件）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
@@ -39,6 +47,12 @@ STATE_FILE = "state.json"
 TARGET_LEVELS = {"ERROR", "CRITICAL", "WARNING"}
 
 PUSH_MAX_PENDING = 5000  # 待推送缓冲上限，超出丢弃最旧条目（本地已归档）
+
+# Server酱官方域名后缀：Turbo/老版（ftqq.com，如 sctapi.ftqq.com）与
+# Server酱³（ft07.com，如 sc3.ft07.com、<uid>.push.ft07.com）。
+# 加载时对指向非官方域名的配置输出告警（不阻断）；注意用精确后缀匹配
+# （host == suffix 或 host.endswith("." + suffix)），避免 "xftqq.com" 误判。
+OFFICIAL_API_HOST_SUFFIXES = ("ftqq.com", "ft07.com")
 
 
 class ErrorNotifyPlugin(MaiBotPlugin):
@@ -63,6 +77,7 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         self._today = date.today()
         self._pushed_today = 0
         self._sendkey_warned = False
+        self._sendblock_warned = False  # 接口地址校验失败时的提示只报一次
         self._state_data: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -72,6 +87,7 @@ class ErrorNotifyPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._ensure_archive_dir()
         cfg = self.config
+        self._log_api_base_warning(cfg)
         self._logs_dir = self._resolve_logs_dir(cfg.plugin.logs_dir)
         self._min_ts = self._compute_min_ts(cfg)
         self._load_state()
@@ -111,12 +127,14 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         cfg = self.config
+        self._log_api_base_warning(cfg)
         self._logs_dir = self._resolve_logs_dir(cfg.plugin.logs_dir)
         self._min_ts = self._compute_min_ts(cfg)
         # 日志目录可能变化，重置文件游标，从新目录开头重新发现
         self._current_file = None
         self._file_offset = 0
         self._sendkey_warned = False
+        self._sendblock_warned = False
         self.ctx.logger.info("报错日志推送配置已更新: version=%s, logs_dir=%s", version, self._logs_dir)
 
     # ------------------------------------------------------------------
@@ -230,8 +248,6 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         level = str(entry.get("level") or "").strip().upper()
         if level not in TARGET_LEVELS:
             return
-        if level == "WARNING" and not self.config.plugin.include_warning:
-            return
 
         ts = self._parse_ts(entry.get("timestamp"))
         if ts <= 0:
@@ -250,6 +266,15 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             "exception": str(entry.get("exception") or ""),
             "created_date": datetime.fromtimestamp(ts).date().isoformat(),
         }
+        if level == "WARNING":
+            # WARN 视同 ERROR 白名单：命中关键词（如 NapCat 断连）的 WARNING
+            # 即使未开启 include_warning 也提升为 ERROR 处理并推送；
+            # 原始级别写入 promoted_from，归档可查。
+            if self._matches_keywords(record, self.config.plugin.warning_as_error_keywords):
+                record["level"] = "ERROR"
+                record["promoted_from"] = "WARNING"
+            elif not self.config.plugin.include_warning:
+                return
         self._write_archive(record)
         # 命中忽略关键词的错误只归档、不进入推送缓冲（见 _matches_ignore）
         if self._matches_ignore(record):
@@ -259,18 +284,19 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             # 只丢"待推送"副本，本地归档不受影响
             self._pending = self._pending[-PUSH_MAX_PENDING:]
 
-    def _matches_ignore(self, record: dict) -> bool:
-        """关键词命中判断：大小写不敏感，匹配 event/exception/logger_name/module。
-
-        命中意味着"这类报错不影响实际使用"：仍写入 errors/ 归档，但不进入推送。
-        """
-        keywords = list(getattr(self.config.plugin, "ignore_keywords", None) or [])
-        if not keywords:
+    def _matches_keywords(self, record: dict, keywords: list[str]) -> bool:
+        """关键词命中判断：大小写不敏感，匹配 event/exception/logger_name/module。"""
+        cleaned = [str(kw).strip().lower() for kw in keywords if str(kw).strip()]
+        if not cleaned:
             return False
         haystack = " ".join(
             str(record.get(field) or "") for field in ("event", "exception", "logger_name", "module")
         ).lower()
-        return any(str(kw).strip().lower() in haystack for kw in keywords if str(kw).strip())
+        return any(kw in haystack for kw in cleaned)
+
+    def _matches_ignore(self, record: dict) -> bool:
+        """命中忽略关键词：仍写入归档，但不进入推送。"""
+        return self._matches_keywords(record, self.config.plugin.ignore_keywords)
 
     # ------------------------------------------------------------------
     # 周期推送
@@ -401,7 +427,16 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         return title, desp
 
     async def _send_serverchan(self, cfg: ErrorNotifyConfig, sendkey: str, title: str, desp: str) -> bool:
-        url = str(cfg.serverchan.serverchan_api_base or "").strip().rstrip("/") + "/" + sendkey + ".send"
+        # 防御性校验：配置在运行中被热改（未走 on_config_update）时兜底，
+        # 确保 SendKey 与错误内容只发往通过校验的地址。
+        base_value = str(cfg.serverchan.serverchan_api_base or "").strip()
+        ok, reason = self._validate_api_base(base_value)
+        if not ok:
+            if not self._sendblock_warned:
+                self._sendblock_warned = True
+                self.ctx.logger.error("serverchan_api_base 无效（%s），已跳过本次推送，请修正配置", reason)
+            return False
+        url = base_value.rstrip("/") + "/" + sendkey + ".send"
         payload = urllib.parse.urlencode({"title": title, "desp": desp}).encode("utf-8")
         last_error: Exception | None = None
         for attempt, backoff in enumerate((0, 2, 6)):
@@ -521,6 +556,65 @@ class ErrorNotifyPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
     # 辅助
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_api_base(base: str) -> tuple[bool, str]:
+        """校验 Server酱接口基址；返回 (是否通过, 说明)。
+
+        不通过时说明为拒绝原因；通过时说明为空字符串（官方域名），
+        或为告警文本（非官方域名，仍需用户确认服务可信）。
+
+        规则：
+        - 仅支持 https（http 可能存在中间人窃取 SendKey / 错误内容）；
+        - 主机名为 IP 字面量时，拒绝回环 / 内网 / 链路本地 / 保留地址
+          （含云厂商元数据服务地址 169.254.169.254 等），防止误配置把
+          数据发到本机或内网服务；
+        - 主机名非 Server酱官方域名（ftqq.com / ft07.com）时通过但告警，
+          便于用户自建兼容服务的同时知晓数据去向；
+        - 不做 DNS 解析：域名类主机名（如 metadata.google.internal）
+          无法静态判断，由"非官方域名告警"兜底。
+        """
+        text = str(base or "").strip()
+        if not text:
+            return False, "接口地址为空"
+        parts = urllib.parse.urlsplit(text)
+        scheme = (parts.scheme or "").lower()
+        if scheme != "https":
+            return False, f"仅支持 https，当前为 {scheme or '(未填写 scheme)'}"
+        host = (parts.hostname or "").strip().lower()
+        if not host:
+            return False, "缺少主机名"
+        # localhost / *.localhost 为本地回环名、*.local 为 mDNS 内网名，
+        # 都不是公网目标，误配会把数据发到本机/内网，直接拒绝。
+        if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+            return False, f"禁止发送到本机 / 内网保留主机名: {host}"
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        if ip is not None and not ip.is_global:
+            return False, f"禁止发送到回环 / 内网 / 保留地址: {host}"
+        if ErrorNotifyPlugin._is_official_api_host(host):
+            return True, ""
+        return (
+            True,
+            f"目标主机 {host} 不是 Server酱官方域名"
+            f"（官方后缀: {'、'.join(OFFICIAL_API_HOST_SUFFIXES)}）；"
+            "SendKey 与错误内容将发送到该地址，请确认服务可信",
+        )
+
+    @staticmethod
+    def _is_official_api_host(host: str) -> bool:
+        return any(host == suffix or host.endswith("." + suffix) for suffix in OFFICIAL_API_HOST_SUFFIXES)
+
+    def _log_api_base_warning(self, cfg: ErrorNotifyConfig) -> None:
+        """加载/配置更新时校验接口地址：无效则 ERROR 提示，非官方域名则 WARNING 告警。"""
+        base_value = str(cfg.serverchan.serverchan_api_base or "").strip()
+        ok, message = self._validate_api_base(base_value)
+        if not ok:
+            self.ctx.logger.error("serverchan_api_base 配置无效（%s），插件将不会发起任何推送", message)
+        elif message:
+            self.ctx.logger.warning("serverchan_api_base 指向非官方域名: %s；如确认可信可忽略本告警", message)
 
     def _resolve_logs_dir(self, configured: str) -> Path | None:
         candidates: list[Path] = []
