@@ -26,6 +26,8 @@ MaiBot 的插件运行在独立 Runner 子进程中，插件 SDK 没有日志类
 - **通知阈值**：同一错误（级别+模块+事件主题）在一个推送周期内出现**达到 `min_occurrences` 次（默认 3）**才会进入推送；未达阈值的错误只记录本地归档（推送正文中同类条目合并标注 `×N`）。设为 `1` 则全部通知。
 - **推送语义（过期不候）**：每个错误带 `created_date`（本地日期）。每次推送只包含**当日**的错误；跨午夜窗口内的昨日错误、超出每日上限后的错误**一律不再补推**（只留本地 `errors/` 归档）。每日推送计数在 00:00 自动重置，次日只推送次日新错误。
 - **仅处理新增错误**：插件只处理加载之后产生的日志，不会重推启动前的历史报错。
+- **时间解析与统一**：优先使用日志行自带的 `ts` 字段（unix 时间戳，精确、时区无关）；`timestamp` 字符串兼容两种形式——插件 Runner 的 UTC ISO（`2026-09-04T16:10:50Z`）与 Host 主进程的无年份本地时间（`09-05 16:05:02`，受 `[log].date_style` 影响）。归档中 `timestamp` 统一规范为本地 `YYYY-MM-DD HH:MM:SS`，原始字符串保存在 `raw_timestamp` 备查，避免混排歧义。
+- **同事件去重**：同一事件可能因 logger 传播在源日志中写多行，或因多文件切换被重读；插件以 `(ts, level, logger_name, event 前缀)` 指纹去重，同一事件只归档一次，推送计数与归档行数一致。
 
 ## 安装
 
@@ -89,7 +91,7 @@ entry_summary_len = 200       # 单条错误摘要最大字符数
 
 插件运行时会在插件目录下生成（均已加入 `.gitignore`）：
 
-- `errors/` — 按天分隔的错误归档目录，**当天错误写入 `errors/<YYYY-MM-DD>.log`**（JSONL 一行一条：timestamp / level / logger_name / module / lineno / event / exception / created_date）；插件启动时自动清理 7 天前的归档文件（保留天数见 `config.py` 常量 `ARCHIVE_KEEP_DAYS`）；
+- `errors/` — 按天分隔的错误归档目录，**当天错误写入 `errors/<YYYY-MM-DD>.log`**（JSONL 一行一条：timestamp（本地 `YYYY-MM-DD HH:MM:SS`）/ raw_timestamp（原始 timestamp 字符串，存在且不同时）/ ts（unix 秒）/ level / logger_name / module / lineno / event / exception / created_date）；插件启动时自动清理 7 天前的归档文件（保留天数见 `config.py` 常量 `ARCHIVE_KEEP_DAYS`）；
 - `state.json` — 文件游标与当日推送计数；
 - `config.toml` — 运行时配置（Runner 依据配置模型生成）。
 

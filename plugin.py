@@ -15,6 +15,13 @@
   warning_as_error_keywords 白名单命中的 WARNING（如 NapCat 断连）即使未开启
   include_warning 也按 ERROR 处理并推送，归档中保留 promoted_from=WARNING
   记录原始级别。
+- 时间解析：优先使用日志行自带的 ts 字段（unix 秒，精确且时区无关）；
+  timestamp 字符串兼容 ISO（含 Z 的 UTC）与无年份本地格式 MM-DD HH:MM:SS
+  （MaiBot Host 侧 [log].date_style 默认输出），归档 timestamp 统一规范为
+  本地 YYYY-MM-DD HH:MM:SS，原始格式另存 raw_timestamp 备查。
+- 同事件去重：日志行可能因 logger 传播（同一事件写多行）或多文件切换
+  重读而被重复处理，以 (ts, level, logger_name, event 前缀) 指纹去重，
+  同一事件只归档一次，避免归档与推送计数膨胀。
 - 接口安全：serverchan_api_base 仅接受 https；回环 / 内网 / 链路本地等
   IP 字面量地址直接拒绝（不发起任何网络请求）；非官方域名（ftqq.com /
   ft07.com 之外）在加载时输出告警，提示 SendKey 与错误内容将发往该地址。
@@ -74,6 +81,7 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         self._min_ts = 0.0  # 时间过滤下界（unix 秒），防止恢复游标时重推历史
 
         self._pending: list[dict[str, Any]] = []
+        self._seen: dict[tuple, float] = {}  # 行级去重指纹 → ts（同事件只归档一次）
         self._today = date.today()
         self._pushed_today = 0
         self._sendkey_warned = False
@@ -249,14 +257,30 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         if level not in TARGET_LEVELS:
             return
 
-        ts = self._parse_ts(entry.get("timestamp"))
-        if ts <= 0:
-            ts = time.time()
+        ts = self._resolve_ts(entry)
         if ts < self._min_ts:
             return
 
+        # 行级去重：同一次事件可能被重复书写/重读（logger 传播、多文件切换），
+        # 指纹相同即视为同一次事件，只归档一次，避免归档与推送计数膨胀。
+        fingerprint = (
+            ts,
+            level,
+            str(entry.get("logger_name") or entry.get("module") or ""),
+            str(entry.get("event") or "")[:80],
+        )
+        if fingerprint in self._seen:
+            return
+        self._seen[fingerprint] = ts
+        if len(self._seen) > 10000:
+            self._seen.clear()
+
+        # 归档时间统一为本地 YYYY-MM-DD HH:MM:SS（与 created_date 的本地
+        # 日期语义一致）；原始 timestamp 字符串保留在 raw_timestamp 备查。
+        raw_timestamp = entry.get("timestamp")
+        timestamp_display = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         record = {
-            "timestamp": entry.get("timestamp") or datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+            "timestamp": timestamp_display,
             "ts": ts,
             "level": level,
             "logger_name": str(entry.get("logger_name") or entry.get("module") or "-"),
@@ -266,6 +290,8 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             "exception": str(entry.get("exception") or ""),
             "created_date": datetime.fromtimestamp(ts).date().isoformat(),
         }
+        if raw_timestamp and str(raw_timestamp) != timestamp_display:
+            record["raw_timestamp"] = str(raw_timestamp)
         if level == "WARNING":
             # WARN 视同 ERROR 白名单：命中关键词（如 NapCat 断连）的 WARNING
             # 即使未开启 include_warning 也提升为 ERROR 处理并推送；
@@ -659,7 +685,27 @@ class ErrorNotifyPlugin(MaiBotPlugin):
         return time.time()
 
     @staticmethod
+    def _resolve_ts(entry: dict) -> float:
+        """按优先级解析事件发生时间（unix 秒）。
+
+        1. 原始日志行自带的 ts 字段（unix 时间戳，精确、时区无关）；
+        2. timestamp 字符串（ISO / YYYY-MM-DD HH:MM:SS / MM-DD HH:MM:SS）；
+        3. 兜底：当前处理时刻（时间信息缺失，只能降级，实际极少触发）。
+        """
+        raw = entry.get("ts")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            ts = float(raw)
+            if ts > 0:
+                return ts
+        ts = ErrorNotifyPlugin._parse_ts(entry.get("timestamp"))
+        if ts > 0:
+            return ts
+        return time.time()
+
+    @staticmethod
     def _parse_ts(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
         if isinstance(value, (int, float)):
             return float(value)
         if not isinstance(value, str) or not value.strip():
@@ -671,7 +717,19 @@ class ErrorNotifyPlugin(MaiBotPlugin):
             try:
                 dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
             except ValueError:
-                return 0.0
+                # MaiBot Host 侧日志：无年份的本地时间（MM-DD HH:MM:SS），
+                # 按当前年份补全；跨年（补全后明显晚于今天）回退一年。
+                try:
+                    dt = datetime.strptime(text, "%m-%d %H:%M:%S")
+                except ValueError:
+                    return 0.0
+                now = datetime.now()
+                try:
+                    dt = dt.replace(year=now.year)
+                    if dt > now + timedelta(days=1):
+                        dt = dt.replace(year=now.year - 1)
+                except ValueError:  # 2 月 29 日等非闰年日期
+                    return 0.0
         if dt.tzinfo is not None:
             dt = dt.astimezone()
         return dt.timestamp()

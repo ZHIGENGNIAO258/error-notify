@@ -9,6 +9,9 @@
 6. 对齐下一个推送边界的时间计算
 7. WARN 视同 ERROR 白名单：命中关键词的 WARNING 按 ERROR 推送，未命中维持原规则
 8. serverchan_api_base 校验（仅 https、拒绝内网/回环，非官方域名告警）
+9. 时间解析：优先日志行自带 ts 字段；MM-DD HH:MM:SS 无年份本地时间补年解析；
+   归档 timestamp 统一规范 + raw_timestamp 留存原始格式
+10. 同事件去重：logger 传播重复行与多文件切换重读均只归档一次
 
 用法:  python tests/smoke_test.py
 """
@@ -161,6 +164,14 @@ def make_plugin(tmp: Path, cfg: types.SimpleNamespace) -> Any:
 
 def archive_path(plugin: Any) -> Path:
     return plugin._plugin_dir / ARCHIVE_DIR_NAME / f"{date.today().isoformat()}.log"
+
+
+def archive_lines(plugin: Any) -> list[dict]:
+    """读取今日归档文件的所有记录（JSONL；不存在则返回空）。"""
+    path = archive_path(plugin)
+    if not path.exists():
+        return []
+    return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
 
 
 def test_scan_and_archive(tmp: Path) -> None:
@@ -704,7 +715,92 @@ def test_parse_ts() -> None:
     assert p("not-a-date") == 0.0
     assert p(123456.0) == 123456.0
     assert p(None) == 0.0
+    assert p(True) == 0.0  # bool 不是合法数值时间戳
+    # 无年份的 MaiBot Host 侧本地时间（MM-DD HH:MM:SS）：补当前年份解析
+    now = datetime.now()
+    assert p(now.strftime("%m-%d %H:%M:%S")) == now.replace(microsecond=0).timestamp(), "MM-DD 格式解析失败"
+    # 跨年回退：12-31 若补当年后明显晚于今天（如 1 月运行时），应解析为去年
+    year_end = datetime.strptime(f"{now.year}-12-31 23:59:59", "%Y-%m-%d %H:%M:%S")
+    if year_end > now + timedelta(days=1):
+        year_end = year_end.replace(year=year_end.year - 1)
+    assert p("12-31 23:59:59") == year_end.timestamp(), year_end
     print("[OK] test_parse_ts")
+
+
+def test_mmdd_time_priority(tmp: Path) -> None:
+    """无年份 MM-DD HH:MM:SS 正确解析，且优先使用日志行自带 ts 字段。
+
+    归档 timestamp 统一规范为本地 YYYY-MM-DD HH:MM:SS；原始格式存入 raw_timestamp。
+    """
+    logs = tmp / "logs_mmdd"
+    cfg = make_cfg()
+    ts_value = time.time() - 1  # 精确 unix 时间戳（时区无关）
+    now = datetime.now()
+    mmdd_str = now.strftime("%m-%d %H:%M:%S")
+    write_log(
+        logs,
+        "app_20260718_000000_main.log.jsonl",
+        [
+            # timestamp 无法解析，但 ts 字段精确 → 应以 ts 为准
+            {"timestamp": "not-a-date", "ts": ts_value, "level": "ERROR", "logger_name": "m", "module": "m.py", "lineno": 1, "event": "带 ts 字段"},
+            # 无 ts 字段，只有无年份本地时间 → 由 MM-DD 分支解析
+            {"timestamp": mmdd_str, "level": "ERROR", "logger_name": "n", "module": "n.py", "lineno": 2, "event": "无 ts 字段"},
+        ],
+    )
+    cfg.plugin.logs_dir = str(logs)
+    plugin = make_plugin(tmp / "mmdd", cfg)
+    plugin._logs_dir = plugin._resolve_logs_dir(cfg.plugin.logs_dir)
+    plugin._min_ts = 0.0
+    plugin._load_state()
+    plugin._scan_once()
+
+    arch = [json.loads(x) for x in archive_path(plugin).read_text(encoding="utf-8").splitlines() if x.strip()]
+    assert len(arch) == 2, arch
+    with_ts = [r for r in arch if r["event"] == "带 ts 字段"][0]
+    assert with_ts["ts"] == ts_value, "应优先使用日志行自带的 ts 字段"
+    assert with_ts["timestamp"] == datetime.fromtimestamp(ts_value).strftime("%Y-%m-%d %H:%M:%S"), with_ts
+    assert with_ts["raw_timestamp"] == "not-a-date", with_ts
+    assert with_ts["created_date"] == datetime.fromtimestamp(ts_value).date().isoformat(), with_ts
+
+    no_ts = [r for r in arch if r["event"] == "无 ts 字段"][0]
+    assert no_ts["ts"] == now.replace(microsecond=0).timestamp(), "MM-DD 格式应解析为当日本地时刻"
+    assert no_ts["timestamp"] == now.strftime("%Y-%m-%d %H:%M:%S"), no_ts
+    assert no_ts["raw_timestamp"] == mmdd_str, no_ts
+    print("[OK] test_mmdd_time_priority")
+
+
+def test_duplicate_dedup(tmp: Path) -> None:
+    """同一事件重复书写/重读时只归档一次（logger 传播与多文件切换回读）。"""
+    logs = tmp / "logs_dedup"
+    cfg = make_cfg()
+    now = time.time()
+    dup = {"timestamp": iso_ts(now - 500), "ts": now - 500, "level": "ERROR", "logger_name": "dup", "module": "d.py", "lineno": 1, "event": "重复事件"}
+    other = {"timestamp": iso_ts(now - 400), "ts": now - 400, "level": "ERROR", "logger_name": "other", "module": "o.py", "lineno": 2, "event": "另一事件"}
+    write_log(logs, "app_20260718_000000_main.log.jsonl", [dup, dup, other])  # 源文件内重复行
+    cfg.plugin.logs_dir = str(logs)
+    plugin = make_plugin(tmp / "dedup", cfg)
+    plugin._logs_dir = plugin._resolve_logs_dir(cfg.plugin.logs_dir)
+    plugin._min_ts = 0.0
+    plugin._load_state()
+    plugin._scan_once()
+
+    assert len(plugin._pending) == 2, [r["event"] for r in plugin._pending]
+    assert len(archive_lines(plugin)) == 2, "重复行应只归档一次"
+
+    # 新文件出现（current 切到 B），再把 A 的 mtime 刷新（current 切回 A → 从头重读 A）
+    write_log(
+        logs,
+        "app_20260718_003000_main.log.jsonl",
+        [{"timestamp": iso_ts(now - 300), "ts": now - 300, "level": "ERROR", "logger_name": "b", "module": "b.py", "lineno": 3, "event": "新文件事件"}],
+    )
+    plugin._scan_once()
+    (logs / "app_20260718_000000_main.log.jsonl").touch()  # 使 A 成为 mtime 最新 → 重读 A
+    plugin._scan_once()
+
+    events = sorted(r["event"] for r in plugin._pending)
+    assert events == ["另一事件", "新文件事件", "重复事件"], f"重读不应重复处理: {events}"
+    assert len(archive_lines(plugin)) == 3, "重读不应重复归档"
+    print("[OK] test_duplicate_dedup")
 
 
 def main() -> None:
@@ -729,6 +825,8 @@ def main() -> None:
         test_archive_cleanup(tmp / "case_cleanup")
         test_boundary()
         test_parse_ts()
+        test_mmdd_time_priority(tmp / "case_mmdd")
+        test_duplicate_dedup(tmp / "case_dedup")
         print("\n全部冒烟测试通过 ✓")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
